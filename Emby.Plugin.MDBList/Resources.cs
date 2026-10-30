@@ -6,7 +6,9 @@
 // -- hence the explicit "public" members below. Kept as a plain (non-static)
 // class so it also works as a ResourceType anchor.
 //------------------------------------------------------------------------------
+using System.Collections.Concurrent;
 using System.Globalization;
+using System.Reflection;
 using System.Resources;
 
 namespace Emby.Plugin.MDBList;
@@ -23,7 +25,7 @@ public class Resources
     /// Gets the <see cref="System.Resources.ResourceManager"/> for this class.
     /// </summary>
     public static ResourceManager ResourceManager =>
-        _resourceManager ??= new ResourceManager("Emby.Plugin.MDBList.Resources", typeof(Resources).Assembly);
+        _resourceManager ??= new EmbeddedResourceManager("Emby.Plugin.MDBList.Resources", typeof(Resources).Assembly);
 
     /// <summary>
     /// Gets or sets the culture used for lookups. Null (the default) means
@@ -150,4 +152,57 @@ public class Resources
     public static string Summary_ActivityPrefix => Get(nameof(Summary_ActivityPrefix));
 
     public static string Summary_Separator => Get(nameof(Summary_Separator));
+
+    /// <summary>
+    /// Loads the neutral and Simplified Chinese resource sets from manifest
+    /// resources embedded directly in this assembly, instead of relying on
+    /// satellite assembly files. Keeps the plugin a single DLL and works on
+    /// every build host.
+    /// </summary>
+    private sealed class EmbeddedResourceManager : ResourceManager
+    {
+        private readonly Assembly _assembly;
+        private readonly string _baseName;
+
+        // By manifest resource name, a miss included: every string lookup
+        // comes through here, and a set read once is the same set every time
+        private readonly ConcurrentDictionary<string, ResourceSet?> _sets = new();
+
+        internal EmbeddedResourceManager(string baseName, Assembly assembly)
+            : base(baseName, assembly)
+        {
+            _baseName = baseName;
+            _assembly = assembly;
+        }
+
+        protected override ResourceSet? InternalGetResourceSet(CultureInfo culture, bool createIfNotExists, bool tryParents)
+        {
+            var current = culture;
+            while (true)
+            {
+                var resourceName = current.Equals(CultureInfo.InvariantCulture)
+                    ? _baseName + ".resources"
+                    : $"{_baseName}.{current.Name}.resources";
+
+                var set = _sets.GetOrAdd(resourceName, Load);
+                if (set is not null)
+                {
+                    return set;
+                }
+
+                if (!tryParents || current.Equals(CultureInfo.InvariantCulture))
+                {
+                    return null;
+                }
+
+                current = current.Parent;
+            }
+        }
+
+        private ResourceSet? Load(string resourceName)
+        {
+            var stream = _assembly.GetManifestResourceStream(resourceName);
+            return stream is null ? null : new ResourceSet(stream);
+        }
+    }
 }
