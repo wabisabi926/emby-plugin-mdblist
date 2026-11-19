@@ -33,7 +33,17 @@ public sealed class SyncOrchestrator : IDisposable
     private static readonly string[] RatingActivityKeys = ["rated_at"];
     private static readonly SyncCategory[] AllCategories = [SyncCategory.Watched, SyncCategory.Ratings, SyncCategory.Collection];
 
-    private readonly SemaphoreSlim _gate = new(1, 1);
+    // How long the scheduled full sync waits for another run to finish.
+    private static readonly TimeSpan ScheduledRunLockWait = TimeSpan.FromMinutes(30);
+
+    // Static: Emby gives the scheduled tasks, the API service, the config
+    // page and the event handlers their own instances of this class, and an
+    // instance gate let a full sync, an activity check and a live push run
+    // at once -- colliding on the state file and letting one run push a
+    // removal from a snapshot another had already made stale (GitHub issue
+    // #7). One gate per process serializes them all. Never disposed.
+    private static readonly SemaphoreSlim _gate = new(1, 1);
+
     private readonly IUserManager _userManager;
     private readonly ILibraryManager _libraryManager;
     private readonly IUserDataManager _userDataManager;
@@ -128,20 +138,20 @@ public sealed class SyncOrchestrator : IDisposable
     /// removal_safety_pattern.md.
     /// </param>
     /// <param name="cancellationToken">The cancellation token.</param>
-    /// <returns>True if a run actually executed.</returns>
-    public async Task<bool> RunAsync(Guid userId, bool allowRemovals, CancellationToken cancellationToken)
+    /// <returns>How the run ended.</returns>
+    public async Task<SyncRunOutcome> RunAsync(Guid userId, bool allowRemovals, CancellationToken cancellationToken)
     {
         using var handle = TryLock();
         if (handle is null)
         {
             _logger.Debug("MDBList Sync: run already in progress, skipping");
-            return false;
+            return SyncRunOutcome.Busy;
         }
 
         var linked = ResolveLinkedUser(userId);
         if (linked is null)
         {
-            return false;
+            return SyncRunOutcome.Skipped;
         }
 
         return await RunForUserAsync(linked.Value.User, linked.Value.Config, allowRemovals, cancellationToken).ConfigureAwait(false);
@@ -154,17 +164,23 @@ public sealed class SyncOrchestrator : IDisposable
     /// </summary>
     /// <param name="allowRemovals">See <see cref="RunAsync"/>.</param>
     /// <param name="cancellationToken">The cancellation token.</param>
-    /// <returns>True if at least one user's run actually executed.</returns>
-    public async Task<bool> RunAllLinkedUsersAsync(bool allowRemovals, CancellationToken cancellationToken)
+    /// <returns>
+    /// Failed if any user's run failed (the others still run), else
+    /// Completed if any ran, else Skipped.
+    /// </returns>
+    public async Task<SyncRunOutcome> RunAllLinkedUsersAsync(bool allowRemovals, CancellationToken cancellationToken)
     {
-        using var handle = TryLock();
-        if (handle is null)
+        // Wait rather than skip: with one gate for every instance, a short
+        // activity check or live push holding it would otherwise make the
+        // daily reconciliation silently skip a whole day.
+        if (!await _gate.WaitAsync(ScheduledRunLockWait, cancellationToken).ConfigureAwait(false))
         {
-            _logger.Debug("MDBList Sync: run already in progress, skipping");
-            return false;
+            _logger.Info("MDBList Sync: another sync is still running after {0} minutes, skipping this run", ScheduledRunLockWait.TotalMinutes);
+            return SyncRunOutcome.Busy;
         }
 
-        var anyRan = false;
+        using var handle = new Releaser(_gate);
+        var result = SyncRunOutcome.Skipped;
         foreach (var config in LinkedUserConfigs())
         {
             var user = _userManager.GetUserById(config.EmbyUserId);
@@ -173,18 +189,35 @@ public sealed class SyncOrchestrator : IDisposable
                 continue;
             }
 
-            anyRan |= await RunForUserAsync(user, config, allowRemovals, cancellationToken).ConfigureAwait(false);
+            SyncRunOutcome outcome;
+            try
+            {
+                outcome = await RunForUserAsync(user, config, allowRemovals, cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                // Not an API error (those are handled inside), e.g. the state
+                // file can't be written -- still let the other users sync.
+                _logger.ErrorException("MDBList Sync: run failed for user {0}", ex, user.Name);
+                outcome = SyncRunOutcome.Failed;
+            }
+
+            // Ordered Skipped < Completed < Failed: the worst outcome wins.
+            if (outcome > result)
+            {
+                result = outcome;
+            }
         }
 
-        return anyRan;
+        return result;
     }
 
-    private async Task<bool> RunForUserAsync(User user, UserSyncConfig config, bool allowRemovals, CancellationToken cancellationToken)
+    private async Task<SyncRunOutcome> RunForUserAsync(User user, UserSyncConfig config, bool allowRemovals, CancellationToken cancellationToken)
     {
         var accessToken = await _oauthService.EnsureValidTokenAsync(user.Id, cancellationToken).ConfigureAwait(false);
         if (string.IsNullOrEmpty(accessToken))
         {
-            return false;
+            return SyncRunOutcome.Skipped;
         }
 
         try
@@ -210,7 +243,7 @@ public sealed class SyncOrchestrator : IDisposable
                     "MDBList Sync: run aborted - library snapshot is empty but remote state is not; "
                         + "treating as an unreliable read rather than a real removal");
                 await _stateStore.SetLastRunAsync(user.Id, new RunSummary { SkippedEmptyLibrary = true }, cancellationToken).ConfigureAwait(false);
-                return false;
+                return SyncRunOutcome.Skipped;
             }
 
             // A library scan mid-flight can make a query legitimately,
@@ -301,13 +334,13 @@ public sealed class SyncOrchestrator : IDisposable
             _logger.Info("MDBList Sync: run complete - {0}", RunSummaryText.Format(summary, CultureInfo.InvariantCulture));
             await _stateStore.SetLastRunAsync(user.Id, summary, cancellationToken).ConfigureAwait(false);
 
-            return true;
+            return SyncRunOutcome.Completed;
         }
         catch (MDBListApiException ex)
         {
             _logger.ErrorException("MDBList Sync: run failed", ex);
             await _stateStore.SetLastRunAsync(user.Id, new RunSummary { FailedMessage = ex.Message }, cancellationToken).ConfigureAwait(false);
-            return false;
+            return SyncRunOutcome.Failed;
         }
     }
 
@@ -479,7 +512,7 @@ public sealed class SyncOrchestrator : IDisposable
     /// <inheritdoc />
     public void Dispose()
     {
-        _gate.Dispose();
+        // Nothing to release: the gate is static and shared by every instance.
     }
 
     private (User User, UserSyncConfig Config)? ResolveLinkedUser(Guid userId)
