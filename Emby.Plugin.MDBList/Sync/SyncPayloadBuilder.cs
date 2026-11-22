@@ -156,6 +156,69 @@ public class SyncPayloadBuilder
         }
     }
 
+    /// <summary>
+    /// Drops the phantom items (see <see cref="FindPhantomKeys"/>) from both
+    /// the stored state, in one write, and the in-memory <paramref name="known"/>
+    /// map the diff then runs on. Never pushes anything to MDBList.
+    /// </summary>
+    /// <param name="stateStore">The sync state store.</param>
+    /// <param name="userId">The Emby user.</param>
+    /// <param name="category">The sync category.</param>
+    /// <param name="known">The remembered items; phantoms are removed from it.</param>
+    /// <param name="currentItems">The current state.</param>
+    /// <param name="isPhantom">The phantom test.</param>
+    /// <param name="cancellationToken">The cancellation token.</param>
+    /// <returns>How many items were dropped.</returns>
+    internal static async Task<int> PrunePhantomsAsync(
+        SyncStateStore stateStore,
+        Guid userId,
+        SyncCategory category,
+        Dictionary<string, KnownSyncItem> known,
+        IReadOnlyDictionary<string, KnownSyncItem> currentItems,
+        Func<KnownSyncItem, bool> isPhantom,
+        CancellationToken cancellationToken)
+    {
+        var phantomKeys = FindPhantomKeys(known, currentItems, isPhantom);
+        if (phantomKeys.Count == 0)
+        {
+            return 0;
+        }
+
+        await stateStore.MergeKnownItemsAsync(userId, category, new Dictionary<string, KnownSyncItem>(), phantomKeys, cancellationToken)
+            .ConfigureAwait(false);
+        foreach (var key in phantomKeys)
+        {
+            known.Remove(key);
+        }
+
+        return phantomKeys.Count;
+    }
+
+    /// <summary>
+    /// The remembered keys that are gone from the current state and that
+    /// <paramref name="isPhantom"/> flags as impossible.
+    /// </summary>
+    /// <param name="known">The remembered items.</param>
+    /// <param name="currentItems">The current state.</param>
+    /// <param name="isPhantom">The phantom test.</param>
+    /// <returns>The keys to drop.</returns>
+    internal static List<string> FindPhantomKeys(
+        IReadOnlyDictionary<string, KnownSyncItem> known,
+        IReadOnlyDictionary<string, KnownSyncItem> currentItems,
+        Func<KnownSyncItem, bool> isPhantom)
+    {
+        var keys = new List<string>();
+        foreach (var (key, item) in known)
+        {
+            if (!currentItems.ContainsKey(key) && isPhantom(item))
+            {
+                keys.Add(key);
+            }
+        }
+
+        return keys;
+    }
+
     private async Task PersistPushedChunkAsync(Guid userId, SyncCategory category, IReadOnlyCollection<KnownSyncItem> chunk, CancellationToken cancellationToken)
     {
         var upserts = new Dictionary<string, KnownSyncItem>(StringComparer.Ordinal);
@@ -238,6 +301,13 @@ public class SyncPayloadBuilder
     /// -- it's simply re-diffed from scratch next run, so once the library
     /// reads back correctly the very next qualifying run pushes it normally.
     /// </param>
+    /// <param name="isPhantom">
+    /// Optional: identifies remembered items that can't correspond to anything
+    /// real (see <see cref="LibrarySnapshot.IsImplausibleEpisode"/>). They are
+    /// dropped from sync state before diffing, without a remote removal --
+    /// MDBList never stored them -- so they neither flood the removal push
+    /// nor keep tripping the removal circuit-breaker on every run.
+    /// </param>
     /// <returns>How many items were pushed as added/removed/skipped.</returns>
     public async Task<PushResult> DiffAndReconcileAsync(
         Guid userId,
@@ -247,9 +317,23 @@ public class SyncPayloadBuilder
         Func<IReadOnlyCollection<KnownSyncItem>, Task> pushRemove,
         Func<KnownSyncItem, KnownSyncItem, bool>? valueChanged,
         CancellationToken cancellationToken,
-        bool allowRemovals = false)
+        bool allowRemovals = false,
+        Func<KnownSyncItem, bool>? isPhantom = null)
     {
         var known = await _stateStore.GetKnownItemsAsync(userId, category, cancellationToken).ConfigureAwait(false);
+
+        if (isPhantom is not null)
+        {
+            var dropped = await PrunePhantomsAsync(_stateStore, userId, category, known, currentItems, isPhantom, cancellationToken)
+                .ConfigureAwait(false);
+            if (dropped > 0)
+            {
+                _logger.Warn(
+                    "MDBList Sync: {0} dropped {1} phantom episodes from sync state (left by a misparsed multi-episode file name)",
+                    category,
+                    dropped);
+            }
+        }
 
         var toAdd = new List<KnownSyncItem>();
         foreach (var (key, item) in currentItems)
